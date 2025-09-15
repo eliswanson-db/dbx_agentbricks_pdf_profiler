@@ -60,7 +60,7 @@ def profile_and_trim_pdf(pdf_paths: pd.Series, pdf_sizes: pd.Series) -> pd.DataF
         try:
             local_path = pdf_path.replace("dbfs:", "/dbfs")
             fname = os.path.basename(pdf_path)
-            silver_path = f"/Volumes/dbxmetagen/default/trimmed_pdfs/udf_tests/{fname}"
+            silver_path = f"/Volumes/dbxmetagen/default/trimmed_pdfs/udf_tests_2/{fname}"
 
             reader = PdfReader(local_path)
             total_pages = len(reader.pages)
@@ -100,11 +100,13 @@ bronze_pdf_stream = (
     spark.readStream
          .format("cloudFiles")
          .option("cloudFiles.format", "binaryFile")
+         .option("cloudFiles.partitionColumns", "")
          .load(f"/Volumes/{catalog}/{source_schema}/{source_volume}")
 )
 
 processed_stream = (
     bronze_pdf_stream
+    #.repartition(4)
     .withColumn("profile", profile_and_trim_pdf(col("path"), col("length")))
     .select(
         col("profile.bronze_path"),
@@ -169,4 +171,12 @@ results
 
 # COMMAND ----------
 
-files[0].size
+df = spark.read.format("binaryFile").load(f"/Volumes/{catalog}/{source_schema}/all_pfizer_files_duplicated_test")
+
+# COMMAND ----------
+
+os.mkdir("/Volumes/dbxmetagen/default/trimmed_pdfs/udf_tests_2/")
+
+# COMMAND ----------
+
+print(df.rdd.getNumPartitions())
