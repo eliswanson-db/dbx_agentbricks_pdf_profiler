@@ -143,3 +143,11 @@ When selecting a PDF processing library for this Databricks project, consider th
 pip install pdfplumber
 pip install PyPDF4
 ```
+
+
+### Logic for implementation:
+
+1. For this process, we want to both (a) gather metadata for profiling and (b) write trimmed PDFs to a silver source
+2. The metadata extraction should be done with a pandas UDF; however, side-effects should happen on the driver using forEachBatch
+3. We could use a hybrid approach, where persist the PDFs via forEachBatch and then extract metadata via a UDF; however, this would require opening the PDFs twice, which will likely be slow
+4. We should assess the speed differences between the hybrid approach versus running everything on the driver
