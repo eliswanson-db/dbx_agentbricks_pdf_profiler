@@ -138,11 +138,11 @@ results = spark.read.table(f"{catalog}.{dest_schema}.{dest_metadata_table}")
 results.display()
 
 # Check for errors
-errors = results.filter(col("error").isNotNull())
+errors = results.filter(col("profile.error").isNotNull())
 errors.display()
 
 # Verify trimmed files exist
-trimmed_files = results.filter(col("trimmed") == True)
+trimmed_files = results.filter(col("profiel.trimmed") == True)
 trimmed_files.display()
 ```
 
@@ -181,38 +181,3 @@ The metadata table contains:
    - Check for corrupted checkpoint directory
    - Create new checkpoint location
    - Monitor cluster resource utilization
-
-
-## Performance Tuning
-
-### Cluster Configuration
-- **Recommendation**: Use compute-optimized instances for PDF processing
-- **Memory**: 8GB+ per core recommended for large PDFs
-- **Parallelism**: Match number of cores to expected file throughput
-
-### Optimization Settings
-```python
-# Increase parallel processing
-.option("cloudFiles.maxFilesPerTrigger", 1000)
-
-# Optimize for small files
-spark.conf.set("spark.sql.files.maxPartitionBytes", "128MB")
-```
-
-## License
-
-See [LICENSE](LICENSE) for details.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Test changes thoroughly on sample PDFs
-4. Submit a pull request
-
-## Support
-
-For issues and questions:
-- Check [troubleshooting](#troubleshooting) section
-- Review Databricks streaming documentation  
-- Open an issue with reproduction steps and error logs
