@@ -85,13 +85,14 @@ class PDFProfiler:
             "total_pages": None,
             "trimmed": False,
             "trimmed_path": None,
+            "pages_after_trim": None,
             "error": None,
         }
 
         try:
             if not isinstance(pdf_path, str) or not pdf_path.lower().endswith(".pdf"):
                 raise ValueError("Path is not a PDF file.")
-            
+
             local_path = self._normalize_path(pdf_path)
 
             if not os.path.exists(local_path):
@@ -119,6 +120,7 @@ class PDFProfiler:
 
                 result["trimmed"] = True
                 result["trimmed_path"] = destination_path
+                result["pages_after_trim"] = trim_to_pages
 
         except Exception as e:
             result["error"] = str(e)
