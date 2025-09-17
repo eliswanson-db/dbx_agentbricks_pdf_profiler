@@ -3,20 +3,57 @@
 
 # COMMAND ----------
 
-dbutils.widgets.text("catalog", "dbxmetagen")
-dbutils.widgets.text("source_schema", "default")
-dbutils.widgets.text("source_volume", "all_pfizer_files")
-dbutils.widgets.text("dest_schema", "default")
-dbutils.widgets.text("dest_volume", "trimmed_pdfs")
-dbutils.widgets.text("dest_metadadta_table", "silver_pdf_parse_metadata")
+# If getting module not found error for pypdf after installing, run the following:
+#dbutils.library.restartPython()
+
+# COMMAND ----------
+
+dbutils.widgets.text("catalog", "")
+dbutils.widgets.text("source_schema", "")
+dbutils.widgets.text("source_volume", "")
+dbutils.widgets.text("dest_schema", "")
+dbutils.widgets.text("dest_volume", "")
+dbutils.widgets.text("dest_metadata_table", "")
 
 catalog = dbutils.widgets.get("catalog")
 source_schema = dbutils.widgets.get("source_schema")
 source_volume = dbutils.widgets.get("source_volume")
 dest_schema = dbutils.widgets.get("dest_schema")
 dest_volume = dbutils.widgets.get("dest_volume")
+dest_metadata_table = dbutils.widgets.get("dest_metadata_table")
 
-dest_metadata_table = dbutils.widgets.get("dest_metadadta_table")
+
+checkpoint_folder = f"/Volumes/{catalog}/{dest_schema}/_checkpoints/{dest_metadata_table}"
+source_path = f"/Volumes/{catalog}/{source_schema}/{source_volume}"
+silver_table = f"{catalog}.{dest_schema}.{dest_metadata_table}"
+dest_path = f"/Volumes/{catalog}/{dest_schema}/{dest_volume}"
+
+# COMMAND ----------
+
+# Validate that all required widgets are present and not empty
+# If you are getting an error here, please make sure all widgets are populated in the notebook
+required_widgets = [
+    "catalog",
+    "source_schema",
+    "source_volume",
+    "dest_schema",
+    "dest_volume",
+    "dest_metadata_table"
+]
+
+for widget in required_widgets:
+    try:
+        value = dbutils.widgets.get(widget)
+        if not value:
+            raise ValueError(f"Widget '{widget}' is empty.")
+    except Exception as e:
+        raise RuntimeError(f"Required widget '{widget}' is missing or invalid.") from e
+
+if not os.path.exists(dest_path):
+    raise ValueError(f"Ensure the destination volume, {dest_path}, exists for your trimmed PDFs. If it does not, you must create it.")
+
+if not os.path.exists(source_path):
+    raise ValueError(f"Ensure the source volume, {source_path}, exists for your PDFs.")
 
 # COMMAND ----------
 
@@ -30,7 +67,7 @@ from typing import Dict
 from pypdf import PdfReader, PdfWriter
 
 class PDFProfiler:
-    def __init__(self, subdir: str = "trimmed_pdfs"):
+    def __init__(self):
         """
         PDF Profiler to extract metadata and optionally trim PDFs.
         
@@ -38,7 +75,6 @@ class PDFProfiler:
             subdir: subdirectory of a given volume where trimmed PDFs are written if
                     no explicit destination is provided.
         """
-        self.subdir = subdir
     
     def profile(self, pdf_path: str) -> Dict:
         """Profile only (no trimming)."""
@@ -48,7 +84,7 @@ class PDFProfiler:
         self,
         pdf_path: str,
         trim_to_pages: int = 10,
-        destination_path: Optional[str] = None,
+        destination_path: str = f"/Volumes/{catalog}/{dest_schema}/{dest_volume}/",
     ) -> Dict:
         """Profile and trim."""
         return self._profile_and_trim(
@@ -62,18 +98,12 @@ class PDFProfiler:
         """Convert dbfs:/ to /dbfs for local access."""
         return path.replace("dbfs:", "")
 
-    def _make_trimmed_path(self, pdf_path: str) -> str:
-        """Return a sibling trimmed path under `self.subdir`."""
-        base_dir = os.path.dirname(pdf_path)
-        fname = os.path.basename(pdf_path)
-        return os.path.join(base_dir, self.subdir, fname)
-
     def _profile_and_trim(
         self,
         pdf_path: str,
         trim_pdfs: bool = False,
         trim_to_pages: int = 10,
-        destination_path: Optional[str] = None,
+        destination_path: str = None,
     ) -> Dict:
         """
         Internal worker: profile a PDF and optionally trim it.
@@ -89,6 +119,7 @@ class PDFProfiler:
             "error": None,
         }
 
+        file_name = os.path.basename(pdf_path)
         try:
             if not isinstance(pdf_path, str) or not pdf_path.lower().endswith(".pdf"):
                 raise ValueError("Path is not a PDF file.")
@@ -110,16 +141,17 @@ class PDFProfiler:
                     writer.add_page(reader.pages[i])
 
                 if destination_path is None:
-                    destination_path = self._make_trimmed_path(pdf_path)
+                    raise ValueError("Destination path unspecified")
 
-                local_dest = self._normalize_path(destination_path)
-                os.makedirs(os.path.dirname(local_dest), exist_ok=True)
+                destination_file_path = os.path.join(destination_path, file_name)
+                local_dest = self._normalize_path(destination_file_path)
+                os.makedirs(os.path.dirname(destination_file_path), exist_ok=True)
 
-                with open(local_dest, "wb") as f:
+                with open(destination_file_path, "wb") as f:
                     writer.write(f)
 
                 result["trimmed"] = True
-                result["trimmed_path"] = destination_path
+                result["trimmed_path"] = destination_file_path
                 result["pages_after_trim"] = trim_to_pages
 
         except Exception as e:
@@ -130,16 +162,26 @@ class PDFProfiler:
 
 profiler = PDFProfiler()
 
+profile_schema = StructType([
+    StructField("path", StringType(), True),
+    StructField("size_bytes", IntegerType(), True),
+    StructField("total_pages", IntegerType(), True),
+    StructField("trimmed", BooleanType(), True),
+    StructField("trimmed_path", StringType(), True),
+    StructField("pages_after_trim", IntegerType(), True),
+    StructField("error", StringType(), True),
+])
+
 @pandas_udf(profile_schema)
 def profile_and_trim_udf(pdf_paths: pd.Series) -> pd.DataFrame:
     return pd.DataFrame([
-        profiler.profile_and_trim(path, trim_to_pages=10) 
+        profiler.profile_and_trim(path) 
         for path in pdf_paths
     ])
 
 
 @pandas_udf(profile_schema)
-def profile_only_udf(pdf_paths: pd.Series) -> pd.DataFrame:
+def profile_udf(pdf_paths: pd.Series) -> pd.DataFrame:
     return pd.DataFrame([
         profiler.profile(path) 
         for path in pdf_paths
@@ -147,28 +189,31 @@ def profile_only_udf(pdf_paths: pd.Series) -> pd.DataFrame:
 
 # COMMAND ----------
 
-silver_table = f"{catalog}.{dest_schema}.{dest_metadata_table}_4"
+# NOTE: This is setup for streaming. As such, the checkpoints will prohibit you from running and re-running this. 
+# If you would like to test this on multiple occasions, you'll have to delete the metadata table as well as the checkpoint
+# NOTE: It is recommended to just the `profile_udf()` function first and check the metadata table to ensure you
+# are getting the expected results before running the `profile_and_trim_udf()` function (commented out below)
 bronze_pdf_stream = (
     spark.readStream
          .format("cloudFiles")
          .option("cloudFiles.format", "binaryFile")
-         .load(f"/Volumes/{catalog}/{source_schema}/{source_volume}")
+         .load(source_path)
 )
 
 processed_stream = (
     bronze_pdf_stream
-    .withColumn("profile", profile_and_trim_pdf(bronze_pdf_stream["path"]))
+    .withColumn("profile", profile_udf(bronze_pdf_stream["path"]))
 )
+
+# processed_stream = (
+#     bronze_pdf_stream
+#     .withColumn("profile", profile_and_trim_udf(bronze_pdf_stream["path"]))
+# )
 
 query = (
     processed_stream.writeStream
-        .option("checkpointLocation", f"/Volumes/{catalog}/{dest_schema}/_checkpoints/{silver_table}_81")
+        .option("checkpointLocation", checkpoint_folder)
         .outputMode("append")
         .trigger(availableNow=True)
-        .outputMode("append")
         .toTable(silver_table)
 )
-
-# COMMAND ----------
-
-spark.read.table(silver_table).display()
