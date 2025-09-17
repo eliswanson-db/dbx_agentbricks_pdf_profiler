@@ -3,24 +3,6 @@
 
 # COMMAND ----------
 
-# To duplicate initial files:
-files = dbutils.fs.ls("/Volumes/dbxmetagen/default/all_pfizer_files")
-dest_volume = "/Volumes/dbxmetagen/default/all_pfizer_files_duplicated_test"
-for i in range(100):
-    for f in files:
-        # Construct new destination path with iteration number to avoid overwriting
-        dest_path = f"{dest_volume}/{i}_{f.name}"
-        dbutils.fs.cp(f.path, dest_path)
-
-# COMMAND ----------
-
-import os
-from pyspark.sql import Row
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType
-from pypdf import PdfReader, PdfWriter
-
-# COMMAND ----------
-
 dbutils.widgets.text("catalog", "dbxmetagen")
 dbutils.widgets.text("source_schema", "default")
 dbutils.widgets.text("source_volume", "all_pfizer_files")
@@ -38,145 +20,153 @@ dest_metadata_table = dbutils.widgets.get("dest_metadadta_table")
 
 # COMMAND ----------
 
+# DBTITLE 1,vfrkbccrlvhbujidvrkkduhednt
 import os
+from typing import Optional
 import pandas as pd
+from pyspark.sql.functions import pandas_udf
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, BooleanType
+from typing import Dict
 from pypdf import PdfReader, PdfWriter
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, LongType
-from pyspark.sql.functions import pandas_udf, col
 
-# Define output schema
-profile_schema = StructType([
-    StructField("bronze_path", StringType(), True),
-    StructField("silver_path", StringType(), True),
-    StructField("total_pages", IntegerType(), True),
-    StructField("initial_pdf_size", LongType(), True),
-    StructField("pages_written", IntegerType(), True),
-])
+class PDFProfiler:
+    def __init__(self, subdir: str = "trimmed_pdfs"):
+        """
+        PDF Profiler to extract metadata and optionally trim PDFs.
+        
+        Args:
+            subdir: subdirectory of a given volume where trimmed PDFs are written if
+                    no explicit destination is provided.
+        """
+        self.subdir = subdir
+    
+    def profile(self, pdf_path: str) -> Dict:
+        """Profile only (no trimming)."""
+        return self._profile_and_trim(pdf_path, trim_pdfs=False)
 
-@pandas_udf(profile_schema)
-def profile_and_trim_pdf(pdf_paths: pd.Series, pdf_sizes: pd.Series) -> pd.DataFrame:
-    results = []
-    for pdf_path, pdf_size in zip(pdf_paths, pdf_sizes):
+    def profile_and_trim(
+        self,
+        pdf_path: str,
+        trim_to_pages: int = 10,
+        destination_path: Optional[str] = None,
+    ) -> Dict:
+        """Profile and trim."""
+        return self._profile_and_trim(
+            pdf_path,
+            trim_pdfs=True,
+            trim_to_pages=trim_to_pages,
+            destination_path=destination_path,
+        )
+    
+    def _normalize_path(self, path: str) -> str:
+        """Convert dbfs:/ to /dbfs for local access."""
+        return path.replace("dbfs:", "")
+
+    def _make_trimmed_path(self, pdf_path: str) -> str:
+        """Return a sibling trimmed path under `self.subdir`."""
+        base_dir = os.path.dirname(pdf_path)
+        fname = os.path.basename(pdf_path)
+        return os.path.join(base_dir, self.subdir, fname)
+
+    def _profile_and_trim(
+        self,
+        pdf_path: str,
+        trim_pdfs: bool = False,
+        trim_to_pages: int = 10,
+        destination_path: Optional[str] = None,
+    ) -> Dict:
+        """
+        Internal worker: profile a PDF and optionally trim it.
+        Returns dict with profile info and error if any.
+        """
+        result = {
+            "path": pdf_path,
+            "size_bytes": None,
+            "total_pages": None,
+            "trimmed": False,
+            "trimmed_path": None,
+            "error": None,
+        }
+
         try:
-            local_path = pdf_path.replace("dbfs:", "/dbfs")
-            fname = os.path.basename(pdf_path)
-            silver_path = f"/Volumes/dbxmetagen/default/trimmed_pdfs/udf_tests_2/{fname}"
+            if not isinstance(pdf_path, str) or not pdf_path.lower().endswith(".pdf"):
+                raise ValueError("Path is not a PDF file.")
+            
+            local_path = self._normalize_path(pdf_path)
+
+            if not os.path.exists(local_path):
+                raise FileNotFoundError(f"PDF not found: {local_path}")
+
+            result["size_bytes"] = os.path.getsize(local_path)
 
             reader = PdfReader(local_path)
             total_pages = len(reader.pages)
-            writer = PdfWriter()
+            result["total_pages"] = total_pages
 
-            for i in range(min(10, total_pages)):
-                writer.add_page(reader.pages[i])
+            if trim_pdfs:
+                writer = PdfWriter()
+                for i in range(min(trim_to_pages, total_pages)):
+                    writer.add_page(reader.pages[i])
 
-            with open(silver_path, "wb") as f:
-                writer.write(f)
+                if destination_path is None:
+                    destination_path = self._make_trimmed_path(pdf_path)
 
-            results.append({
-                "bronze_path": pdf_path,
-                "silver_path": silver_path.replace("/dbfs", "dbfs:"),
-                "total_pages": total_pages,
-                "initial_pdf_size": int(pdf_size),
-                "pages_written": min(10, total_pages),
-            })
-        except Exception:
-            results.append({
-                "bronze_path": pdf_path,
-                "silver_path": None,
-                "total_pages": None,
-                "initial_pdf_size": int(pdf_size),
-                "pages_written": None,
-            })
-    return pd.DataFrame(results)
+                local_dest = self._normalize_path(destination_path)
+                os.makedirs(os.path.dirname(local_dest), exist_ok=True)
 
+                with open(local_dest, "wb") as f:
+                    writer.write(f)
+
+                result["trimmed"] = True
+                result["trimmed_path"] = destination_path
+
+        except Exception as e:
+            result["error"] = str(e)
+
+        return result
+
+
+profiler = PDFProfiler()
+
+@pandas_udf(profile_schema)
+def profile_and_trim_udf(pdf_paths: pd.Series) -> pd.DataFrame:
+    return pd.DataFrame([
+        profiler.profile_and_trim(path, trim_to_pages=10) 
+        for path in pdf_paths
+    ])
+
+
+@pandas_udf(profile_schema)
+def profile_only_udf(pdf_paths: pd.Series) -> pd.DataFrame:
+    return pd.DataFrame([
+        profiler.profile(path) 
+        for path in pdf_paths
+    ])
 
 # COMMAND ----------
 
-volume_path = f"/Volumes/{catalog}/{source_schema}/{source_volume}/"
-schema_path = f"/tmp/{catalog}_{source_volume}_schema"
-silver_table = f"{catalog}.{dest_schema}.{dest_metadata_table}"
-
+silver_table = f"{catalog}.{dest_schema}.{dest_metadata_table}_4"
 bronze_pdf_stream = (
     spark.readStream
          .format("cloudFiles")
          .option("cloudFiles.format", "binaryFile")
-         .option("cloudFiles.partitionColumns", "")
          .load(f"/Volumes/{catalog}/{source_schema}/{source_volume}")
 )
 
 processed_stream = (
     bronze_pdf_stream
-    #.repartition(4)
-    .withColumn("profile", profile_and_trim_pdf(col("path"), col("length")))
-    .select(
-        col("profile.bronze_path"),
-        col("profile.silver_path"),
-        col("profile.total_pages"),
-        col("profile.initial_pdf_size"),
-        col("profile.pages_written"),
-    )
+    .withColumn("profile", profile_and_trim_pdf(bronze_pdf_stream["path"]))
 )
 
 query = (
     processed_stream.writeStream
-        .format("delta")
-        .option("checkpointLocation", f"/Volumes/{catalog}/{dest_schema}/_checkpoints/{silver_table}_5")
+        .option("checkpointLocation", f"/Volumes/{catalog}/{dest_schema}/_checkpoints/{silver_table}_81")
+        .outputMode("append")
+        .trigger(availableNow=True)
         .outputMode("append")
         .toTable(silver_table)
 )
 
 # COMMAND ----------
 
-files = dbutils.fs.ls(volume_path)
-results = []
-for f in files:
-    if f.path.endswith(".csv"):
-        print(f"found csv: {f.path}")
-        continue
-    try:
-        local_path = f.path.replace("dbfs:", "")
-        size_of_file = f.size
-        fname = os.path.basename(local_path)
-        silver_path = f"/Volumes/dbxmetagen/default/trimmed_pdfs/{fname}"
-
-        reader = PdfReader(local_path)
-        total_pages = len(reader.pages)
-        writer = PdfWriter()
-
-        for i in range(min(10, total_pages)):
-            writer.add_page(reader.pages[i])
-
-        with open(silver_path, "wb") as f:
-            writer.write(f)
-
-        results.append({
-            "bronze_path": local_path,
-            "silver_path": silver_path.replace("/dbfs", "dbfs:"),
-            "total_pages": total_pages,
-            "initial_pdf_size": int(size_of_file),
-            "pages_written": min(10, total_pages),
-        })
-    except Exception as e:
-        print(f"File errored: {f}")
-        results.append({
-            "bronze_path": local_path,
-            "silver_path": None,
-            "total_pages": None,
-            "initial_pdf_size": int(size_of_file),
-            "pages_written": None,
-        })
-
-
-results
-
-# COMMAND ----------
-
-df = spark.read.format("binaryFile").load(f"/Volumes/{catalog}/{source_schema}/all_pfizer_files_duplicated_test")
-
-# COMMAND ----------
-
-os.mkdir("/Volumes/dbxmetagen/default/trimmed_pdfs/udf_tests_2/")
-
-# COMMAND ----------
-
-print(df.rdd.getNumPartitions())
+spark.read.table(silver_table).display()
