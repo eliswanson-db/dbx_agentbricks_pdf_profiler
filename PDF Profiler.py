@@ -1,4 +1,8 @@
 # Databricks notebook source
+import configparser
+from dataclasses import dataclass
+
+
 !pip install pypdf==6.0.0
 
 # COMMAND ----------
@@ -14,50 +18,41 @@ dbutils.widgets.text("source_volume", "")
 dbutils.widgets.text("dest_schema", "")
 dbutils.widgets.text("dest_volume", "")
 dbutils.widgets.text("dest_metadata_table", "")
-
-catalog = dbutils.widgets.get("catalog")
-source_schema = dbutils.widgets.get("source_schema")
-source_volume = dbutils.widgets.get("source_volume")
-dest_schema = dbutils.widgets.get("dest_schema")
-dest_volume = dbutils.widgets.get("dest_volume")
-dest_metadata_table = dbutils.widgets.get("dest_metadata_table")
+dbutils.widgets.dropdown("mode", "profile", ["profile", "profile_and_trim"], "Mode")
 
 
 checkpoint_folder = f"/Volumes/{catalog}/{dest_schema}/_checkpoints/{dest_metadata_table}"
 source_path = f"/Volumes/{catalog}/{source_schema}/{source_volume}"
 silver_table = f"{catalog}.{dest_schema}.{dest_metadata_table}"
 dest_path = f"/Volumes/{catalog}/{dest_schema}/{dest_volume}"
+@dataclass
+class ProfilerConfig:
+    catalog: str
+    source_schema: str
+    source_volume: str
+    dest_schema: str
+    dest_volume: str
+    dest_metadata_table: str
+    mode: str
+    
+    def __init__(self, **kwargs):                
+        self.catalog = dbutils.widgets.get("catalog")
+        self.source_schema = dbutils.widgets.get("source_schema")
+        self.source_volume = dbutils.widgets.get("source_volume")
+        self.dest_schema = dbutils.widgets.get("dest_schema")
+        self.dest_volume = dbutils.widgets.get("dest_volume")
+        self.dest_metadata_table = dbutils.widgets.get("dest_metadata_table")
+        self.mode = dbutils.widgets.get("mode")
+        
+    def __post_init__(self):
+        self.checkpoint_folder = f"/Volumes/{self.catalog}/{self.dest_schema}/_checkpoints/{self.dest_metadata_table}"
+        self.source_path = f"/Volumes/{self.catalog}/{self.source_schema}/{self.source_volume}"
+        self.silver_table = f"{self.catalog}.{self.dest_schema}.{self.dest_metadata_table}"
+        self.dest_path = f"/Volumes/{self.catalog}/{self.dest_schema}/{self.dest_volume}"
 
 # COMMAND ----------
 
-# Validate that all required widgets are present and not empty
-# If you are getting an error here, please make sure all widgets are populated in the notebook
-required_widgets = [
-    "catalog",
-    "source_schema",
-    "source_volume",
-    "dest_schema",
-    "dest_volume",
-    "dest_metadata_table"
-]
-
-for widget in required_widgets:
-    try:
-        value = dbutils.widgets.get(widget)
-        if not value:
-            raise ValueError(f"Widget '{widget}' is empty.")
-    except Exception as e:
-        raise RuntimeError(f"Required widget '{widget}' is missing or invalid.") from e
-
-if not os.path.exists(dest_path):
-    raise ValueError(f"Ensure the destination volume, {dest_path}, exists for your trimmed PDFs. If it does not, you must create it.")
-
-if not os.path.exists(source_path):
-    raise ValueError(f"Ensure the source volume, {source_path}, exists for your PDFs.")
-
-# COMMAND ----------
-
-# DBTITLE 1,vfrkbccrlvhbujidvrkkduhednt
+# DBTITLE 1,Imports
 import os
 from typing import Optional
 import pandas as pd
@@ -66,6 +61,18 @@ from pyspark.sql.types import StructType, StructField, StringType, IntegerType, 
 from typing import Dict
 from pypdf import PdfReader, PdfWriter
 
+# COMMAND ----------
+profile_schema = StructType([
+    StructField("path", StringType(), True),
+    StructField("size_bytes", IntegerType(), True),
+    StructField("total_pages", IntegerType(), True),
+    StructField("trimmed", BooleanType(), True),
+    StructField("trimmed_path", StringType(), True),
+    StructField("pages_after_trim", IntegerType(), True),
+    StructField("error", StringType(), True),
+])
+    
+# COMMAND ----------
 class PDFProfiler:
     def __init__(self):
         """
@@ -83,15 +90,15 @@ class PDFProfiler:
     def profile_and_trim(
         self,
         pdf_path: str,
-        trim_to_pages: int = 10,
-        destination_path: str = f"/Volumes/{catalog}/{dest_schema}/{dest_volume}/",
+        profiler_config: ProfilerConfig,
+        trim_to_pages: int = 10
     ) -> Dict:
         """Profile and trim."""
         return self._profile_and_trim(
             pdf_path,
             trim_pdfs=True,
             trim_to_pages=trim_to_pages,
-            destination_path=destination_path,
+            destination_path=profiler_config.dest_path,
         )
     
     def _normalize_path(self, path: str) -> str:
@@ -160,60 +167,100 @@ class PDFProfiler:
         return result
 
 
-profiler = PDFProfiler()
+def validate_widgets():
+    """
+    Validate that all required widgets are present and not empty. 
+    If you are getting an error here, please make sure all widgets are populated in the notebook
+    """
+    
+    required_widgets = [
+        "catalog",
+        "source_schema",
+        "source_volume",
+        "dest_schema",
+        "dest_volume",
+        "dest_metadata_table"
+    ]
 
-profile_schema = StructType([
-    StructField("path", StringType(), True),
-    StructField("size_bytes", IntegerType(), True),
-    StructField("total_pages", IntegerType(), True),
-    StructField("trimmed", BooleanType(), True),
-    StructField("trimmed_path", StringType(), True),
-    StructField("pages_after_trim", IntegerType(), True),
-    StructField("error", StringType(), True),
-])
+    for widget in required_widgets:
+        try:
+            value = dbutils.widgets.get(widget)
+            if not value:
+                raise ValueError(f"Widget '{widget}' is empty.")
+        except Exception as e:
+            raise RuntimeError(f"Required widget '{widget}' is missing or invalid.") from e
+
+    if not os.path.exists(dest_path):
+        raise ValueError(f"Ensure the destination volume, {dest_path}, exists for your trimmed PDFs. If it does not, you must create it.")
+
+    if not os.path.exists(source_path):
+        raise ValueError(f"Ensure the source volume, {source_path}, exists for your PDFs.")
+
 
 @pandas_udf(profile_schema)
-def profile_and_trim_udf(pdf_paths: pd.Series) -> pd.DataFrame:
+def profile_and_trim_udf(pdf_paths: pd.Series, profiler_config: ProfilerConfig) -> pd.DataFrame:
+    profiler = PDFProfiler()
     return pd.DataFrame([
-        profiler.profile_and_trim(path) 
+        profiler.profile_and_trim(path, profiler_config) 
         for path in pdf_paths
     ])
 
 
 @pandas_udf(profile_schema)
 def profile_udf(pdf_paths: pd.Series) -> pd.DataFrame:
+    profiler = PDFProfiler()
     return pd.DataFrame([
         profiler.profile(path) 
         for path in pdf_paths
     ])
-
-# COMMAND ----------
-
-# NOTE: This is setup for streaming. As such, the checkpoints will prohibit you from running and re-running this. 
-# If you would like to test this on multiple occasions, you'll have to delete the metadata table as well as the checkpoint
-# NOTE: It is recommended to just the `profile_udf()` function first and check the metadata table to ensure you
-# are getting the expected results before running the `profile_and_trim_udf()` function (commented out below)
-bronze_pdf_stream = (
-    spark.readStream
+    
+    
+def bronze_pdf_stream(source_path: str) -> DataFrame:
+    """
+    Read the bronze PDF stream.
+    """
+    return (spark.readStream
          .format("cloudFiles")
          .option("cloudFiles.format", "binaryFile")
          .load(source_path)
-)
+         )
 
-processed_stream = (
-    bronze_pdf_stream
-    .withColumn("profile", profile_udf(bronze_pdf_stream["path"]))
-)
 
-# processed_stream = (
-#     bronze_pdf_stream
-#     .withColumn("profile", profile_and_trim_udf(bronze_pdf_stream["path"]))
-# )
+def process_files(mode: str, bronze_pdf_stream: DataFrame, profiler_config: ProfilerConfig) -> DataFrame:
+    """
+    Process the files.
+    """
+    if mode == "profile":
+        return bronze_pdf_stream.withColumn("profile", profile_udf(bronze_pdf_stream["path"], profiler_config))
+    elif mode == "profile_and_trim":
+        return bronze_pdf_stream.withColumn("profile", profile_and_trim_udf(bronze_pdf_stream["path"], profiler_config))
+    else:
+        raise ValueError(f"Invalid mode: {mode}. Expected 'profile' or 'profile_and_trim'.")
 
-query = (
-    processed_stream.writeStream
-        .option("checkpointLocation", checkpoint_folder)
-        .outputMode("append")
-        .trigger(availableNow=True)
-        .toTable(silver_table)
-)
+
+def write_stream(processed_stream: DataFrame, profiler_config: ProfilerConfig) -> DataFrame:
+    return (
+        processed_stream.writeStream
+            .option("checkpointLocation", profiler_config.checkpoint_folder)
+            .outputMode("append")
+            .trigger(availableNow=True)
+            .toTable(profiler_config.silver_table)
+        )
+
+
+def main():
+    validate_widgets()
+    profiler_config = ProfilerConfig()
+    bronze_pdf_stream = bronze_pdf_stream(profiler_config.source_path)
+    processed_stream = process_files(profiler_config.mode, bronze_pdf_stream)
+    write_stream(processed_stream, profiler_config)
+
+# COMMAND ----------
+# NOTE: This is setup for streaming. As such, the checkpoints will prohibit you from running and re-running this. 
+# If you would like to test this on multiple occasions in development, you'll have to delete the metadata table 
+# as well as the checkpoint each time you want to re-run the notebook.
+# NOTE: It is recommended to just the `profile_udf()` function first and check the metadata table to ensure you
+# are getting the expected results before running the `profile_and_trim_udf()` function (commented out below)
+
+if __name__ == "__main__":
+    main()
