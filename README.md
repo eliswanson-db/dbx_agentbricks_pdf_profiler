@@ -1,6 +1,6 @@
 # DBX AI PDF Profiler
 
-A Databricks-based tool for profiling and trimming PDF files at scale using Spark structured streaming. This tool extracts metadata from PDFs and can optionally trim them to a specified number of pages, making them suitable for downstream AI processing.
+A Databricks-based tool for profiling and trimming PDF files at scale using Spark structured streaming. This tool extracts metadata from PDFs and can optionally trim them to a specified number of pages, making them suitable for downstream AI processing. This can be particularly useful for AgentBricks, which will process all pages for files that it reads.
 
 ## Overview
 
