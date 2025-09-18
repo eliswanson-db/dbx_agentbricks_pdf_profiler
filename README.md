@@ -36,6 +36,8 @@ This is a Databricks notebook - no separate installation required. Dependencies 
    - `dest_schema`: Schema for destination volume
    - `dest_volume`: Volume for trimmed PDFs
    - `dest_metadadta_table`: Table name for profiled metadata
+   - `mode`: set profile or profile_and_trim
+   - `trim_to_pages`: PDFs will be trimmed to this number of pages
 
 2. **Run the Notebook**: Execute all cells to start the streaming job
 
@@ -43,7 +45,7 @@ This is a Databricks notebook - no separate installation required. Dependencies 
 
 ### Core Components
 
-- **`PDFProfiler` Class**: Core logic for PDF processing
+- **`PDFProfiler` Class**: Core logic for PDF processing. Set this via mode widget
   - `profile()`: Extract metadata only
   - `profile_and_trim()`: Extract metadata and trim PDF
 - **Pandas UDFs**: Spark-compatible functions for distributed processing
@@ -68,13 +70,14 @@ This is a Databricks notebook - no separate installation required. Dependencies 
 - **What it does**: Processes all currently available files then stops
 - **Use case**: Batch-like processing of existing files
 - **Gotcha**: Stream will terminate after processing existing files - won't wait for new ones. Note 
-that this will affect you trying to conduct multiple runs. If you would like to manually run this multiple times with no new data, one will have to remove the checkpoints and the table. 
+that this will affect you trying to conduct multiple runs. If you would like to manually run this multiple times with no new data, one will have to remove the checkpoints and the table. If new data arrive, the checkpoints will allow autoloader to only process the new files.
 
 #### 2. **Continuous Streaming Alternative**
 For continuous processing of new files:
 ```python
 .trigger(processingTime='10 seconds')  # Process every 10 seconds
 # Remove availableNow=True
+# DO NOT use this with autoloader
 ```
 
 #### 3. **Checkpoint Management**
@@ -98,9 +101,12 @@ For continuous processing of new files:
 
 ### Step 1: Environment Setup
 
+Create schemas first if needed.
+
 1. **Create or Ensure Volumes Exist**:
    ```sql
-   -- Source volume (should contain your PDFs)
+   -- Source volume (most likely this already exists and contains your PDFs)
+   -- If not you can create and add files.
    CREATE VOLUME IF NOT EXISTS {catalog}.{source_schema}.{source_volume};
    
    -- Destination volume (will be created automatically)
@@ -117,11 +123,11 @@ For continuous processing of new files:
 
 2. **Run Notebook Cells**:
    ```
-   Cell 1: Install dependencies
-   Cell 2: Set up widgets and variables  
-   Cell 3: Define PDFProfiler class and UDFs
-   Cell 4: Create and start streaming query
-   Cell 5: Display results
+   Install dependencies
+   Set up widgets and variables  
+   Define PDFProfiler class and UDFs
+   Create and start streaming query
+   Display results
    ```
 
 ### Step 3: Monitor Execution
@@ -162,22 +168,17 @@ The metadata table contains:
 
 ## Troubleshooting
 
-### Common Issues
-
 1. **Permission Errors**
-   - Ensure Databricks cluster has access to Unity Catalog volumes
+   - Ensure user or SPN has access to volumes and tables
+   - Check that dest schema, checkpoint volume, and destination volume + subfolder are either created or the user has permissions to create.
    - Check volume permissions for read/write access
 
 2. **File Not Found Errors**
    - Verify PDF files exist in source volume
-   - Check path formatting (dbfs: vs /dbfs)
 
 3. **OOM Errors**
-   - Reduce `maxFilesPerTrigger`
-   - Use cluster with more memory
-   - Consider processing smaller batches
+   - Reduce `maxFilesPerTrigger` to process smaller batches
+   - Use cluster with more memory - driver or workers depending on where error is appearing
 
 4. **Streaming Query Stuck**
-   - Check for corrupted checkpoint directory
-   - Create new checkpoint location
-   - Monitor cluster resource utilization
+   - Reset checkpoints (will re-ingest everything so use with caution)
