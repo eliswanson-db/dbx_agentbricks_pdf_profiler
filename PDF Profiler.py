@@ -1,13 +1,18 @@
 # Databricks notebook source
-import configparser
-from dataclasses import dataclass
+# MAGIC %md 
+# MAGIC # Install necessary libraries
 
+# COMMAND ----------
 
 !pip install pypdf==6.0.0
 
 # COMMAND ----------
 
-# If getting module not found error for pypdf after installing, run the following:
+# MAGIC %md
+# MAGIC # If getting module not found error for pypdf after installing, restart Python after library install:
+
+# COMMAND ----------
+
 #dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -17,38 +22,15 @@ dbutils.widgets.text("source_schema", "")
 dbutils.widgets.text("source_volume", "")
 dbutils.widgets.text("dest_schema", "")
 dbutils.widgets.text("dest_volume", "")
+dbutils.widgets.text("dest_subfolder", "")
 dbutils.widgets.text("dest_metadata_table", "")
+dbutils.widgets.text("trim_to_pages", "10")
 dbutils.widgets.dropdown("mode", "profile", ["profile", "profile_and_trim"], "Mode")
 
+# COMMAND ----------
 
-checkpoint_folder = f"/Volumes/{catalog}/{dest_schema}/_checkpoints/{dest_metadata_table}"
-source_path = f"/Volumes/{catalog}/{source_schema}/{source_volume}"
-silver_table = f"{catalog}.{dest_schema}.{dest_metadata_table}"
-dest_path = f"/Volumes/{catalog}/{dest_schema}/{dest_volume}"
-@dataclass
-class ProfilerConfig:
-    catalog: str
-    source_schema: str
-    source_volume: str
-    dest_schema: str
-    dest_volume: str
-    dest_metadata_table: str
-    mode: str
-    
-    def __init__(self, **kwargs):                
-        self.catalog = dbutils.widgets.get("catalog")
-        self.source_schema = dbutils.widgets.get("source_schema")
-        self.source_volume = dbutils.widgets.get("source_volume")
-        self.dest_schema = dbutils.widgets.get("dest_schema")
-        self.dest_volume = dbutils.widgets.get("dest_volume")
-        self.dest_metadata_table = dbutils.widgets.get("dest_metadata_table")
-        self.mode = dbutils.widgets.get("mode")
-        
-    def __post_init__(self):
-        self.checkpoint_folder = f"/Volumes/{self.catalog}/{self.dest_schema}/_checkpoints/{self.dest_metadata_table}"
-        self.source_path = f"/Volumes/{self.catalog}/{self.source_schema}/{self.source_volume}"
-        self.silver_table = f"{self.catalog}.{self.dest_schema}.{self.dest_metadata_table}"
-        self.dest_path = f"/Volumes/{self.catalog}/{self.dest_schema}/{self.dest_volume}"
+# MAGIC %md
+# MAGIC # Imports
 
 # COMMAND ----------
 
@@ -56,13 +38,127 @@ class ProfilerConfig:
 import os
 from typing import Optional
 import pandas as pd
-from pyspark.sql.functions import pandas_udf
+from pyspark.sql.functions import pandas_udf, split, element_at, concat, lit, col, concat_ws, md5
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, BooleanType
+from pyspark.sql import DataFrame
 from typing import Dict
 from pypdf import PdfReader, PdfWriter
+from dataclasses import dataclass, field
+import logging
 
 # COMMAND ----------
-profile_schema = StructType([
+
+# MAGIC %md
+# MAGIC # Setup widgets and a configuration dictionary
+
+# COMMAND ----------
+
+def make_config():
+    catalog = dbutils.widgets.get("catalog")
+    source_schema = dbutils.widgets.get("source_schema")
+    source_volume = dbutils.widgets.get("source_volume")
+    dest_schema = dbutils.widgets.get("dest_schema")
+    dest_volume = dbutils.widgets.get("dest_volume")
+    dest_subfolder = dbutils.widgets.get("dest_subfolder")
+    dest_metadata_table = dbutils.widgets.get("dest_metadata_table")
+    trim_to_pages = int(dbutils.widgets.get("trim_to_pages"))
+    mode = dbutils.widgets.get("mode")
+    config_map = {
+            "catalog": catalog,
+            "source_schema": source_schema,
+            "source_volume": source_volume,
+            "dest_schema": dest_schema,
+            "dest_volume": dest_volume,
+            "dest_subfolder": dest_subfolder,
+            "dest_metadata_table": dest_metadata_table,
+            "trim_to_pages": trim_to_pages,
+            "mode": mode,
+        }
+    return config_map
+
+
+@dataclass
+class ProfilerConfig:
+    """Configuration dataclass for computed paths."""
+    catalog: str
+    source_schema: str
+    source_volume: str
+    dest_schema: str
+    dest_volume: str
+    dest_subfolder: str
+    dest_metadata_table: str
+    trim_to_pages: int
+    mode: str
+    checkpoint_folder: str = field(init=False)
+    source_path: str = field(init=False)
+    dest_table: str = field(init=False)
+    full_dest_volume: str = field(init=False)
+    dest_path: str = field(init=False)
+
+    @classmethod
+    def process_dbutils(cls, dbutil_map):
+        obj = cls(
+            catalog=dbutil_map["catalog"],
+            source_schema=dbutil_map["source_schema"],
+            source_volume=dbutil_map["source_volume"],
+            dest_schema=dbutil_map["dest_schema"],
+            dest_volume=dbutil_map["dest_volume"],
+            dest_subfolder=dbutil_map["dest_subfolder"],
+            dest_metadata_table=dbutil_map["dest_metadata_table"],
+            trim_to_pages=int(dbutil_map["trim_to_pages"]),
+            mode=dbutil_map["mode"]
+        )
+        obj.checkpoint_folder = f"/Volumes/{obj.catalog}/{obj.dest_schema}/_checkpoints/{obj.dest_metadata_table}"
+        obj.source_path = f"/Volumes/{obj.catalog}/{obj.source_schema}/{obj.source_volume}"
+        obj.dest_table = f"{obj.catalog}.{obj.dest_schema}.{obj.dest_metadata_table}"
+        obj.full_dest_volume = f"{obj.catalog}.{obj.dest_schema}.{obj.dest_volume}"
+        obj.dest_path = os.path.join(
+            f"/Volumes/{obj.catalog}/{obj.dest_schema}/{obj.dest_volume}",
+            obj.dest_subfolder
+        )
+        return obj
+    
+
+def validate_widgets(profiler_config: ProfilerConfig):
+    """
+    Validate that all required widgets are present and not empty. 
+    If you are getting an error here, please make sure all widgets are populated in the notebook
+    """
+    
+    required_widgets = [
+        "catalog",
+        "source_schema",
+        "source_volume",
+        "dest_schema",
+        "dest_volume",
+        "dest_metadata_table",
+        "mode",
+        "trim_to_pages"
+    ]
+
+    for widget in required_widgets:
+        try:
+            value = dbutils.widgets.get(widget)
+            if not value:
+                raise ValueError(f"Widget '{widget}' is empty.")
+        except Exception as e:
+            raise RuntimeError(f"Required widget '{widget}' is missing or invalid.") from e
+
+    if not os.path.exists(profiler_config.dest_path):
+        raise ValueError(f"Ensure the destination volume and folder, {profiler_config.dest_path}, exists for your trimmed PDFs. If it does not, you must create it.")
+
+    if not os.path.exists(profiler_config.source_path):
+        raise ValueError(f"Ensure the source volume, {profiler_config.source_path}, exists for your PDFs.")
+
+
+# COMMAND ----------
+
+# MAGIC %md 
+# MAGIC # Define globals and validate widgets
+
+# COMMAND ----------
+
+PROFILE_SCHEMA = StructType([
     StructField("path", StringType(), True),
     StructField("size_bytes", IntegerType(), True),
     StructField("total_pages", IntegerType(), True),
@@ -71,8 +167,18 @@ profile_schema = StructType([
     StructField("pages_after_trim", IntegerType(), True),
     StructField("error", StringType(), True),
 ])
-    
+config_map = make_config()
+PROFILER_CONFIG = ProfilerConfig.process_dbutils(config_map)
+validate_widgets(PROFILER_CONFIG)
+
 # COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Define functions
+
+# COMMAND ----------
+
+
 class PDFProfiler:
     def __init__(self):
         """
@@ -166,56 +272,32 @@ class PDFProfiler:
 
         return result
 
+def make_profile_and_trim_udf(profiler_config, profile_schema):
+    """Higher-order function returning pandas UDF to handle passing config."""
+    @pandas_udf(profile_schema)
+    def profile_and_trim_udf(pdf_paths: pd.Series) -> pd.DataFrame:
+        profiler = PDFProfiler()
+        return pd.DataFrame([
+            profiler.profile_and_trim(path, profiler_config=profiler_config, trim_to_pages=profiler_config.trim_to_pages) 
+            for path in pdf_paths
+        ])
 
-def validate_widgets():
-    """
-    Validate that all required widgets are present and not empty. 
-    If you are getting an error here, please make sure all widgets are populated in the notebook
-    """
+    return profile_and_trim_udf
+
+
+def make_profile_udf(profile_schema):
+    """Higher-order function returning pandas UDF to handle passing config."""
+    @pandas_udf(profile_schema)
+    def profile_udf(pdf_paths: pd.Series) -> pd.DataFrame:
+        profiler = PDFProfiler()
+        return pd.DataFrame([
+            profiler.profile(path)
+            for path in pdf_paths
+        ])
+    return profile_udf
     
-    required_widgets = [
-        "catalog",
-        "source_schema",
-        "source_volume",
-        "dest_schema",
-        "dest_volume",
-        "dest_metadata_table"
-    ]
 
-    for widget in required_widgets:
-        try:
-            value = dbutils.widgets.get(widget)
-            if not value:
-                raise ValueError(f"Widget '{widget}' is empty.")
-        except Exception as e:
-            raise RuntimeError(f"Required widget '{widget}' is missing or invalid.") from e
-
-    if not os.path.exists(dest_path):
-        raise ValueError(f"Ensure the destination volume, {dest_path}, exists for your trimmed PDFs. If it does not, you must create it.")
-
-    if not os.path.exists(source_path):
-        raise ValueError(f"Ensure the source volume, {source_path}, exists for your PDFs.")
-
-
-@pandas_udf(profile_schema)
-def profile_and_trim_udf(pdf_paths: pd.Series, profiler_config: ProfilerConfig) -> pd.DataFrame:
-    profiler = PDFProfiler()
-    return pd.DataFrame([
-        profiler.profile_and_trim(path, profiler_config) 
-        for path in pdf_paths
-    ])
-
-
-@pandas_udf(profile_schema)
-def profile_udf(pdf_paths: pd.Series) -> pd.DataFrame:
-    profiler = PDFProfiler()
-    return pd.DataFrame([
-        profiler.profile(path) 
-        for path in pdf_paths
-    ])
-    
-    
-def bronze_pdf_stream(source_path: str) -> DataFrame:
+def read_bronze_pdf_stream(source_path: str) -> DataFrame:
     """
     Read the bronze PDF stream.
     """
@@ -223,19 +305,30 @@ def bronze_pdf_stream(source_path: str) -> DataFrame:
          .format("cloudFiles")
          .option("cloudFiles.format", "binaryFile")
          .load(source_path)
+         .select("modificationTime", "path", "length")
          )
 
 
-def process_files(mode: str, bronze_pdf_stream: DataFrame, profiler_config: ProfilerConfig) -> DataFrame:
+def process_files(profiler_config: ProfilerConfig, bronze_pdf_stream: DataFrame) -> DataFrame:
     """
     Process the files.
     """
-    if mode == "profile":
-        return bronze_pdf_stream.withColumn("profile", profile_udf(bronze_pdf_stream["path"], profiler_config))
-    elif mode == "profile_and_trim":
-        return bronze_pdf_stream.withColumn("profile", profile_and_trim_udf(bronze_pdf_stream["path"], profiler_config))
+    if profiler_config.mode == "profile":
+        profile_udf = make_profile_udf(PROFILE_SCHEMA)
+        return (bronze_pdf_stream
+                .withColumn("profile", profile_udf(bronze_pdf_stream["path"]))
+                .withColumn("id", md5(concat_ws("|", col("modificationTime"), col("path"))))
+                .select("id", "modificationTime", "profile.*")
+        )
+    elif profiler_config.mode == "profile_and_trim":
+        profile_and_trim_udf = make_profile_and_trim_udf(profiler_config, PROFILE_SCHEMA)
+        return (bronze_pdf_stream
+                .withColumn("profile", profile_and_trim_udf(bronze_pdf_stream["path"]))
+                .withColumn("id", md5(concat_ws("|", col("modificationTime"), col("path"))))
+                .select("id", "modificationTime", "profile.*")
+        )
     else:
-        raise ValueError(f"Invalid mode: {mode}. Expected 'profile' or 'profile_and_trim'.")
+        raise ValueError(f"Invalid mode: {profiler_config.mode}. Expected 'profile' or 'profile_and_trim'.")
 
 
 def write_stream(processed_stream: DataFrame, profiler_config: ProfilerConfig) -> DataFrame:
@@ -244,18 +337,37 @@ def write_stream(processed_stream: DataFrame, profiler_config: ProfilerConfig) -
             .option("checkpointLocation", profiler_config.checkpoint_folder)
             .outputMode("append")
             .trigger(availableNow=True)
-            .toTable(profiler_config.silver_table)
+            .toTable(profiler_config.dest_table)
+            .awaitTermination()
         )
 
 
-def main():
-    validate_widgets()
-    profiler_config = ProfilerConfig()
-    bronze_pdf_stream = bronze_pdf_stream(profiler_config.source_path)
-    processed_stream = process_files(profiler_config.mode, bronze_pdf_stream)
+def create_subfolder(folder_path: str) -> None:
+    """
+    Create a subfolder if it doesn't exist.
+    """
+    try:
+        os.mkdir(profiler_config.dest_path)
+    except FileExistsError:
+        print("Folder already exists. Skipping make directory...")
+    except Exception as e:
+        print(f"{e}")
+
+
+def main(profiler_config):
+    spark.sql(f"CREATE VOLUME IF NOT EXISTS {profiler_config.full_dest_volume}")
+    create_subfolder(profiler_config.dest_path)
+    bronze_pdf_stream = read_bronze_pdf_stream(profiler_config.source_path)
+    processed_stream = process_files(profiler_config, bronze_pdf_stream)
     write_stream(processed_stream, profiler_config)
 
 # COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Run ingestion 
+
+# COMMAND ----------
+
 # NOTE: This is setup for streaming. As such, the checkpoints will prohibit you from running and re-running this. 
 # If you would like to test this on multiple occasions in development, you'll have to delete the metadata table 
 # as well as the checkpoint each time you want to re-run the notebook.
@@ -263,4 +375,13 @@ def main():
 # are getting the expected results before running the `profile_and_trim_udf()` function (commented out below)
 
 if __name__ == "__main__":
-    main()
+    main(PROFILER_CONFIG)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Check results for debug
+
+# COMMAND ----------
+
+spark.sql(f"SELECT * FROM {config_map.get('catalog')}.{config_map.get('dest_schema')}.{config_map.get('dest_metadata_table')} LIMIT 5").display()
