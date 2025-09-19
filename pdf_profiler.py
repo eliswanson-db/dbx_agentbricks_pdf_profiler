@@ -347,7 +347,7 @@ def create_subfolder(folder_path: str) -> None:
     Create a subfolder if it doesn't exist.
     """
     try:
-        os.mkdir(profiler_config.dest_path)
+        os.mkdir(folder_path)
     except FileExistsError:
         print("Folder already exists. Skipping make directory...")
     except Exception as e:
