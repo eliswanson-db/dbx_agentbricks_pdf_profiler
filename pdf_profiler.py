@@ -16,16 +16,18 @@
 #dbutils.library.restartPython()
 
 # COMMAND ----------
-
+# Required
 dbutils.widgets.text("catalog", "")
 dbutils.widgets.text("source_schema", "")
 dbutils.widgets.text("source_volume", "")
 dbutils.widgets.text("dest_schema", "")
 dbutils.widgets.text("dest_volume", "")
-dbutils.widgets.text("dest_subfolder", "")
 dbutils.widgets.text("dest_metadata_table", "")
+
+# Optional
 dbutils.widgets.text("trim_to_pages", "10")
 dbutils.widgets.dropdown("mode", "profile", ["profile", "profile_and_trim"], "Mode")
+dbutils.widgets.text("dest_subfolder", "")
 
 # COMMAND ----------
 
@@ -347,7 +349,7 @@ def create_subfolder(folder_path: str) -> None:
     Create a subfolder if it doesn't exist.
     """
     try:
-        os.mkdir(profiler_config.dest_path)
+        os.mkdir(folder_path)
     except FileExistsError:
         print("Folder already exists. Skipping make directory...")
     except Exception as e:
